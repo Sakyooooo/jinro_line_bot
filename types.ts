@@ -13,7 +13,7 @@ export type Phase = 'LOBBY' | 'SETUP' | 'START' | 'NIGHT' | 'MORNING' | 'DAY' | 
 
 export type ChatChannel = 'GLOBAL' | 'DEAD' | 'WOLVES' | 'BOT_DM';
 
-export type ScreenState = 'HOME' | 'CREATE' | 'JOIN' | 'GAME';
+export type ScreenState = 'HOME' | 'CREATE' | 'JOIN' | 'GAME' | 'DEBUG';
 
 export interface Message {
   id: string;

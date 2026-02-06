@@ -3,15 +3,16 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Users, Settings, Moon, Sun, Send, MessageCircle, User as UserIcon, Shield, Ghost, 
   Trash2, Crown, ChevronRight, AlertCircle, Skull, Clock,
-  ArrowRight, CheckCircle2, XCircle, UserCheck, Key, Copy, RefreshCw, Eye, EyeOff, PlusCircle, LogIn, ChevronDown, RotateCcw, ArrowRightCircle
+  ArrowRight, CheckCircle2, XCircle, UserCheck, Key, Copy, RefreshCw, Eye, EyeOff, PlusCircle, LogIn, ChevronDown, RotateCcw, ArrowRightCircle, Activity
 } from 'lucide-react';
-import { ROLES, TEMPLATES } from './constants';
-import { Player, Phase, Message, GameState, UserProfile, Team, ChatChannel, ScreenState } from './types';
+import { ROLES, TEMPLATES } from './constants.tsx';
+import { Player, Phase, Message, GameState, UserProfile, Team, ChatChannel, ScreenState } from './types.ts';
 
-// ゲーム定数（秒）
+// ゲーム定数
 const NIGHT_LIMIT = 300; 
 const DAY_LIMIT = 300; 
 const VOTE_LIMIT = 120;
+const SYNC_INTERVAL = 2000; // ポーリング間隔（2秒）
 
 const generatePasscode = () => Math.floor(100000 + Math.random() * 900000).toString();
 const generateRoomId = () => Math.random().toString(36).substr(2, 6).toUpperCase();
@@ -87,13 +88,91 @@ export default function App() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
 
-  // 襲撃演出用ステート
+  // 演出用
   const [attackEffect, setAttackEffect] = useState(false);
   const prevPhaseRef = useRef<Phase>(game.phase);
   const me = game.players.find(p => p.id === currentUser.id);
   const prevAliveRef = useRef<boolean>(me?.isAlive ?? true);
 
-  // 永続化と画面遷移の監視
+  // 同期ロック
+  const isSyncingRef = useRef(false);
+
+  // --- API同期ロジック ---
+
+  const pushGameToServer = async (targetGame: GameState) => {
+    if (!targetGame.roomId || isSyncingRef.current) return;
+    try {
+      isSyncingRef.current = true;
+      await fetch(`/api/room`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(targetGame),
+      });
+    } catch (err) {
+      console.error('Push error:', err);
+    } finally {
+      isSyncingRef.current = false;
+    }
+  };
+
+  const fetchGameFromServer = async () => {
+    if (!game.roomId || isSyncingRef.current || screen === 'HOME' || screen === 'DEBUG') return;
+    try {
+      const res = await fetch(`/api/room?id=${game.roomId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      
+      setGame(prev => {
+        const hasNewContent = data.messages.length > prev.messages.length || data.phase !== prev.phase || data.day !== prev.day;
+        
+        if (hasNewContent) {
+          return {
+            ...prev,
+            phase: data.phase,
+            day: data.day,
+            timer: data.timer,
+            players: data.players,
+            messages: data.messages,
+            winner: data.winner,
+            roleConfig: data.roleConfig
+          };
+        }
+
+        const updatedPlayers = prev.players.map(p => {
+          const remoteP = data.players.find((rp: Player) => rp.id === p.id);
+          if (remoteP && remoteP.id !== currentUser.id) {
+            return { ...p, hasActed: remoteP.hasActed, skipAgreed: remoteP.skipAgreed, voteTarget: remoteP.voteTarget, nightActionTarget: remoteP.nightActionTarget };
+          }
+          return p;
+        });
+
+        const newJoiners = data.players.filter((rp: Player) => !prev.players.some(p => p.id === rp.id));
+        
+        return {
+          ...prev,
+          players: [...updatedPlayers, ...newJoiners]
+        };
+      });
+    } catch (err) {
+      console.error('Fetch error:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (screen !== 'GAME' || !game.roomId) return;
+    const interval = setInterval(fetchGameFromServer, SYNC_INTERVAL);
+    return () => clearInterval(interval);
+  }, [screen, game.roomId]);
+
+  useEffect(() => {
+    if (me?.isHost && game.roomId) {
+      const timer = setTimeout(() => pushGameToServer(game), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [game.phase, game.day, game.players.length, game.messages.length, game.winner, me?.isHost]);
+
+  // --- 基本機能 ---
+
   useEffect(() => {
     localStorage.setItem('werewolf-token-v3', JSON.stringify(currentUser));
     localStorage.setItem('werewolf-instance-v3', JSON.stringify(game));
@@ -104,10 +183,8 @@ export default function App() {
     }
   }, [currentUser, game, screen, resumeHistory]);
 
-  // 襲撃演出のトリガー監視（夜から朝への切り替わり時）
   useEffect(() => {
     if (prevPhaseRef.current === 'NIGHT' && game.phase === 'DAY') {
-      // 自分が「生存」から「襲撃死」に変わったかチェック
       if (prevAliveRef.current === true && me?.isAlive === false && me?.deathReason === '襲撃') {
         setAttackEffect(true);
         setTimeout(() => setAttackEffect(false), 3000);
@@ -117,7 +194,6 @@ export default function App() {
     prevAliveRef.current = me?.isAlive ?? true;
   }, [game.phase, me?.isAlive, me?.deathReason]);
 
-  // チャットの自動追従（メッセージ増分時に最下部付近ならスクロール）
   useEffect(() => {
     if (isAtBottom && chatEndRef.current) {
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -164,7 +240,7 @@ export default function App() {
     }));
   };
 
-  const handleCreateRoom = () => {
+  const handleCreateRoom = async () => {
     if (!formDisplayName.trim()) { setErrorMsg('表示名を入力してください'); return; }
     try {
       const rid = generateRoomId();
@@ -176,48 +252,68 @@ export default function App() {
         phase: 'SETUP', day: 0, players: [host], messages: [createMsg('bot', 'GM Bot', `ルーム「${formRoomName || rid}」が作成されました。`, 'GLOBAL')],
         timer: 0, roleConfig: { ...TEMPLATES[formPlayerCount] }
       };
+      
+      await pushGameToServer(newGame);
+
       updateResumeHistory({ roomId: rid, roomName: newGame.roomName, playerToken: currentUser.id, displayName: formDisplayName, lastSeenAt: Date.now() });
       setCurrentUser(prev => ({ ...prev, name: formDisplayName }));
       setGame(newGame);
       setScreen('GAME');
-    } catch (err) { setErrorMsg('作成失敗'); }
+    } catch (err: any) { 
+      setErrorMsg(err.message || '作成失敗。データベース接続を確認してください。'); 
+    }
   };
 
-  const handleJoinRoom = () => {
+  const handleJoinRoom = async () => {
     if (!formDisplayName.trim() || !formRoomId || inputPasscode.length !== 6) { setErrorMsg('入力を確認してください'); return; }
-    if (formRoomId.toUpperCase() !== game.roomId) { setErrorMsg('ルームが見つかりません'); return; }
-    if (mockHash(inputPasscode) !== game.passcodeHash) { setErrorMsg('パスコードが違います'); return; }
+    
+    try {
+      const res = await fetch(`/api/room?id=${formRoomId.toUpperCase()}`);
+      if (!res.ok) {
+        if (res.status === 404) throw new Error('ルームが見つかりません。Vercel Postgresの同期を確認してください。');
+        throw new Error('サーバーエラー');
+      }
+      const remoteGame = await res.json();
 
-    const isMember = game.players.some(p => p.id === currentUser.id);
-    if (!isMember) {
-      const p: Player = { id: currentUser.id, name: formDisplayName, roleId: 'village', isAlive: true, isHost: false, isNPC: false, hasActed: false, skipAgreed: false };
-      setGame(prev => ({
-        ...prev,
-        players: [...prev.players, p],
-        messages: [...prev.messages, createMsg('bot', 'GM Bot', `${formDisplayName}さんが入室しました。`, 'GLOBAL')]
-      }));
+      if (mockHash(inputPasscode) !== remoteGame.passcodeHash) { setErrorMsg('パスコードが違います'); return; }
+
+      const isMember = remoteGame.players.some((p: Player) => p.id === currentUser.id);
+      let nextGame = { ...remoteGame };
+      if (!isMember) {
+        const p: Player = { id: currentUser.id, name: formDisplayName, roleId: 'village', isAlive: true, isHost: false, isNPC: false, hasActed: false, skipAgreed: false };
+        nextGame.players = [...remoteGame.players, p];
+        nextGame.messages = [...remoteGame.messages, createMsg('bot', 'GM Bot', `${formDisplayName}さんが入室しました。`, 'GLOBAL')];
+        await pushGameToServer(nextGame);
+      }
+
+      updateResumeHistory({ roomId: formRoomId.toUpperCase(), roomName: remoteGame.roomName, playerToken: currentUser.id, displayName: formDisplayName, lastSeenAt: Date.now() });
+      setCurrentUser(prev => ({ ...prev, name: formDisplayName }));
+      setGame(nextGame);
+      setScreen('GAME');
+    } catch (err: any) {
+      setErrorMsg(err.message);
     }
-    updateResumeHistory({ roomId: formRoomId.toUpperCase(), roomName: game.roomName, playerToken: currentUser.id, displayName: formDisplayName, lastSeenAt: Date.now() });
-    setCurrentUser(prev => ({ ...prev, name: formDisplayName }));
-    setScreen('GAME');
   };
 
-  const handleResumeFromRecord = (record: ResumeRecord) => {
-    if (record.roomId !== game.roomId) {
+  const handleResumeFromRecord = async (record: ResumeRecord) => {
+    try {
+      const res = await fetch(`/api/room?id=${record.roomId}`);
+      if (!res.ok) throw new Error('セッションが終了しているかDBから削除されました');
+      const remoteGame = await res.json();
+      
+      setCurrentUser({ id: record.playerToken, name: record.displayName });
+      updateResumeHistory({ ...record, lastSeenAt: Date.now() });
+      setGame(remoteGame);
+      setScreen('GAME');
+    } catch (err: any) {
       setResumeHistory(prev => prev.filter(r => r.roomId !== record.roomId));
-      setErrorMsg('セッションが終了しています');
-      return;
+      setErrorMsg(err.message);
     }
-    setCurrentUser({ id: record.playerToken, name: record.displayName });
-    updateResumeHistory({ ...record, lastSeenAt: Date.now() });
-    setScreen('GAME');
   };
 
   const handleResumeSession = () => {
     const record = resumeHistory.find(r => r.roomId === formRoomId.toUpperCase());
-    if (record) {
-      handleResumeFromRecord(record);
-    }
+    if (record) handleResumeFromRecord(record);
   };
 
   const jumpToLatest = () => {
@@ -225,30 +321,26 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const handleSendMessage = (e: React.FormEvent) => {
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputMessage.trim()) return;
     
-    setGame(prev => ({
-      ...prev,
-      messages: [...prev.messages, createMsg(currentUser.id, currentUser.name, inputMessage, activeChannel, activeChannel === 'BOT_DM' ? 'bot' : undefined)]
-    }));
+    const newMsg = createMsg(currentUser.id, currentUser.name, inputMessage, activeChannel, activeChannel === 'BOT_DM' ? 'bot' : undefined);
+    setGame(prev => {
+      const next = { ...prev, messages: [...prev.messages, newMsg] };
+      pushGameToServer(next);
+      return next;
+    });
     setInputMessage('');
   };
 
   const handleRematch = () => {
     setGame(prev => {
       const resetPlayers = prev.players.map(p => ({
-        ...p,
-        isAlive: true,
-        hasActed: false,
-        skipAgreed: false,
-        nightActionTarget: undefined,
-        voteTarget: undefined,
-        deathReason: undefined
+        ...p, isAlive: true, hasActed: false, skipAgreed: false,
+        nightActionTarget: undefined, voteTarget: undefined, deathReason: undefined
       }));
-      
-      return {
+      const next = {
         ...prev,
         phase: 'SETUP' as Phase,
         day: 0,
@@ -257,6 +349,8 @@ export default function App() {
         timer: 0,
         winner: undefined
       };
+      pushGameToServer(next);
+      return next;
     });
   };
 
@@ -275,17 +369,23 @@ export default function App() {
     Object.entries(game.roleConfig).forEach(([rid, count]) => { for (let i = 0; i < (count as number); i++) pool.push(rid); });
     const shuffled = pool.sort(() => Math.random() - 0.5);
     const nextPlayers = game.players.map((p, i) => ({ ...p, roleId: shuffled[i], isAlive: true, hasActed: false, skipAgreed: false }));
-    setGame(prev => ({ ...prev, phase: 'NIGHT', day: 1, players: nextPlayers, timer: NIGHT_LIMIT }));
-    postGlobal("=== ゲーム開始 ===\n夜が来ました。役職者はBotチャットを確認してください。");
-    nextPlayers.forEach(p => {
-      if (!p.isNPC) {
-        postBotDM(p.id, `役職: 【${ROLES[p.roleId].name}】\n${ROLES[p.roleId].description}`);
-        if (p.roleId === 'seer') postBotDM(p.id, "【案内】初日は自動的に「村人陣営」の誰か一人が白と判明します。");
-        if (p.roleId === 'wolf') {
-          const partners = nextPlayers.filter(x => x.id !== p.id && x.roleId === 'wolf').map(x => x.name);
-          if (partners.length > 0) postBotDM(p.id, `仲間: ${partners.join(', ')}`);
+    
+    setGame(prev => {
+      const next = { ...prev, phase: 'NIGHT' as Phase, day: 1, players: nextPlayers, timer: NIGHT_LIMIT };
+      const startMsgs = [createMsg('bot', 'GM Bot', "=== ゲーム開始 ===\n夜が来ました。役職者はBotチャットを確認してください。", 'GLOBAL')];
+      nextPlayers.forEach(p => {
+        if (!p.isNPC) {
+          startMsgs.push(createMsg('bot', 'GM Bot', `役職: 【${ROLES[p.roleId].name}】\n${ROLES[p.roleId].description}`, 'BOT_DM', p.id));
+          if (p.roleId === 'seer') startMsgs.push(createMsg('bot', 'GM Bot', "【案内】初日は自動的に「村人陣営」の誰か一人が白と判明します。", 'BOT_DM', p.id));
+          if (p.roleId === 'wolf') {
+            const partners = nextPlayers.filter(x => x.id !== p.id && x.roleId === 'wolf').map(x => x.name);
+            if (partners.length > 0) startMsgs.push(createMsg('bot', 'GM Bot', `仲間: ${partners.join(', ')}`, 'BOT_DM', p.id));
+          }
         }
-      }
+      });
+      next.messages = [...next.messages, ...startMsgs];
+      pushGameToServer(next);
+      return next;
     });
   };
 
@@ -306,6 +406,7 @@ export default function App() {
         const target = players.find(p => p.id === killId);
         if (target && target.roleId !== 'fox') { target.isAlive = false; target.deathReason = '襲撃'; deaths.push(`${target.name}さんが無残な姿で発見されました。`); }
       }
+      const newDMMessages: Message[] = [];
       players.filter(p => p.isAlive && p.roleId === 'seer').forEach(p => {
         let tid: string | undefined;
         if (prev.day === 1) {
@@ -316,11 +417,17 @@ export default function App() {
         if (tid) {
           const t = players.find(x => x.id === tid);
           const isW = t && ROLES[t.roleId].team === 'WEREWOLF' && t.roleId !== 'madman';
-          if (!p.isNPC) prev.messages.push(createMsg('bot', 'GM Bot', `${t?.name}さんは「${isW ? '人狼' : '村人'}」でした。`, 'BOT_DM', p.id));
+          if (!p.isNPC) newDMMessages.push(createMsg('bot', 'GM Bot', `${t?.name}さんは「${isW ? '人狼' : '村人'}」でした。`, 'BOT_DM', p.id));
           if (t?.roleId === 'fox') { t.isAlive = false; t.deathReason = '呪殺'; deaths.push(`${t.name}さんが変わり果てた姿で見つかりました。`); }
         }
       });
-      return checkVictory({ ...prev, phase: 'DAY', timer: DAY_LIMIT, players: players.map(p => ({ ...p, nightActionTarget: undefined, hasActed: false, skipAgreed: false })), messages: [...prev.messages, ...newsMessages(deaths, prev.day, players)] });
+      const next = checkVictory({ 
+        ...prev, phase: 'DAY' as Phase, timer: DAY_LIMIT, 
+        players: players.map(p => ({ ...p, nightActionTarget: undefined, hasActed: false, skipAgreed: false })), 
+        messages: [...prev.messages, ...newDMMessages, ...newsMessages(deaths, prev.day, players)] 
+      });
+      pushGameToServer(next);
+      return next;
     });
   };
 
@@ -350,7 +457,13 @@ export default function App() {
       }
 
       const victim = prev.players.find(p => p.id === victimId);
-      return checkVictory({ ...prev, phase: 'NIGHT', day: prev.day + 1, timer: NIGHT_LIMIT, players: prev.players.map(p => p.id === victimId ? { ...p, isAlive: false, deathReason: '処刑' } : { ...p, voteTarget: undefined, hasActed: false, skipAgreed: false }), messages: [...prev.messages, createMsg('bot', 'GM Bot', `${victim?.name}さんが処刑されました。`, 'GLOBAL')] });
+      const next = checkVictory({ 
+        ...prev, phase: 'NIGHT' as Phase, day: prev.day + 1, timer: NIGHT_LIMIT, 
+        players: prev.players.map(p => p.id === victimId ? { ...p, isAlive: false, deathReason: '処刑' } : { ...p, voteTarget: undefined, hasActed: false, skipAgreed: false }), 
+        messages: [...prev.messages, createMsg('bot', 'GM Bot', `${victim?.name}さんが処刑されました。`, 'GLOBAL')] 
+      });
+      pushGameToServer(next);
+      return next;
     });
   };
 
@@ -366,19 +479,23 @@ export default function App() {
   };
 
   const handleAction = (targetId: string) => {
-    setGame(prev => ({
-      ...prev,
-      players: prev.players.map(p => {
-        if (p.id !== currentUser.id) return p;
-        if (prev.phase === 'NIGHT') return { ...p, nightActionTarget: targetId, hasActed: true };
-        if (prev.phase === 'VOTE' || prev.phase === 'REVOTE') return { ...p, voteTarget: targetId, hasActed: true };
-        return p;
-      })
-    }));
+    setGame(prev => {
+      const next = {
+        ...prev,
+        players: prev.players.map(p => {
+          if (p.id !== currentUser.id) return p;
+          if (prev.phase === 'NIGHT') return { ...p, nightActionTarget: targetId, hasActed: true };
+          if (prev.phase === 'VOTE' || prev.phase === 'REVOTE') return { ...p, voteTarget: targetId, hasActed: true };
+          return p;
+        })
+      };
+      pushGameToServer(next);
+      return next;
+    });
   };
 
   useEffect(() => {
-    if (game.phase === 'LOBBY' || game.phase === 'SETUP' || game.phase === 'RESULT') return;
+    if (game.phase === 'LOBBY' || game.phase === 'SETUP' || game.phase === 'RESULT' || !me?.isHost) return;
     const interval = setInterval(() => {
       setGame(prev => {
         if (prev.phase === 'LOBBY' || prev.phase === 'SETUP' || prev.phase === 'RESULT') return prev;
@@ -386,7 +503,6 @@ export default function App() {
         const players = prev.players.map(p => {
           if (!p.isNPC || !p.isAlive) return p;
           if (prev.phase === 'NIGHT' && !p.hasActed) {
-            if (prev.day === 1 && p.roleId === 'seer') return p;
             const targets = prev.players.filter(t => t.isAlive && t.id !== p.id);
             const target = targets[Math.floor(Math.random() * targets.length)];
             if (target) { changed = true; return { ...p, nightActionTarget: target.id, hasActed: true }; }
@@ -403,17 +519,19 @@ export default function App() {
       });
     }, 4000);
     return () => clearInterval(interval);
-  }, [game.phase, game.day]);
+  }, [game.phase, game.day, me?.isHost]);
 
   useEffect(() => {
     let interval: any;
-    if (['NIGHT', 'DAY', 'VOTE', 'REVOTE'].includes(game.phase) && game.timer > 0) {
+    if (['NIGHT', 'DAY', 'VOTE', 'REVOTE'].includes(game.phase) && game.timer > 0 && me?.isHost) {
       interval = setInterval(() => { setGame(prev => ({ ...prev, timer: Math.max(0, prev.timer - 1) })); }, 1000);
     }
     return () => clearInterval(interval);
-  }, [game.phase, game.timer]);
+  }, [game.phase, game.timer, me?.isHost]);
 
   useEffect(() => {
+    if (!me?.isHost) return;
+    
     if (game.phase === 'NIGHT') {
       const active = game.players.filter(p => p.isAlive && (game.day === 1 && p.roleId === 'seer' ? false : ['wolf', 'seer', 'knight'].includes(p.roleId)));
       if (active.length > 0 && active.every(p => p.hasActed)) resolveNight();
@@ -422,7 +540,11 @@ export default function App() {
       const agreed = survivors.filter(p => p.skipAgreed).length;
       if (survivors.length > 0 && agreed >= Math.ceil(survivors.length / 2)) {
         postGlobal("過半数が同意したため議論を終了します。");
-        setGame(prev => ({ ...prev, phase: 'VOTE', timer: VOTE_LIMIT }));
+        setGame(prev => {
+          const next = { ...prev, phase: 'VOTE' as Phase, timer: VOTE_LIMIT };
+          pushGameToServer(next);
+          return next;
+        });
       }
     } else if (game.phase === 'VOTE' || game.phase === 'REVOTE') {
       const voters = game.players.filter(p => p.isAlive);
@@ -430,10 +552,10 @@ export default function App() {
     }
     if (game.timer === 0 && ['NIGHT', 'DAY', 'VOTE', 'REVOTE'].includes(game.phase)) {
       if (game.phase === 'NIGHT') resolveNight();
-      if (game.phase === 'DAY') setGame(prev => ({ ...prev, phase: 'VOTE', timer: VOTE_LIMIT }));
+      if (game.phase === 'DAY') setGame(prev => ({ ...prev, phase: 'VOTE' as Phase, timer: VOTE_LIMIT }));
       if (game.phase === 'VOTE' || game.phase === 'REVOTE') resolveVote();
     }
-  }, [game.players, game.timer, game.phase]);
+  }, [game.players, game.timer, game.phase, me?.isHost]);
 
   const prefersReducedMotion = typeof window !== 'undefined' ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
 
@@ -467,6 +589,86 @@ export default function App() {
           <div className="grid grid-cols-2 gap-4">
             <button onClick={() => setScreen('CREATE')} className="flex flex-col items-center gap-4 bg-slate-800 p-6 rounded-3xl border border-slate-700 hover:border-blue-500 shadow-xl"><PlusCircle size={24} className="text-blue-500"/><div className="text-sm font-black text-white">ルーム作成</div></button>
             <button onClick={() => setScreen('JOIN')} className="flex flex-col items-center gap-4 bg-slate-800 p-6 rounded-3xl border border-slate-700 hover:border-indigo-500 shadow-xl"><LogIn size={24} className="text-indigo-500"/><div className="text-sm font-black text-white">ルーム参加</div></button>
+          </div>
+          <div className="text-center pt-4 opacity-20 hover:opacity-100 transition-opacity">
+            <button onClick={() => setScreen('DEBUG')} className="text-[9px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-1 mx-auto border-b border-transparent hover:border-slate-500">
+              <Activity size={10}/> システム診断
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'DEBUG') {
+    const [diag, setDiag] = useState<any>(null);
+    const [loading, setLoading] = useState(false);
+    const [debugKey, setDebugKey] = useState('');
+
+    const runDiag = async () => {
+      setLoading(true);
+      try {
+        const res = await fetch(`/api/health?key=${debugKey}`);
+        const data = await res.json();
+        setDiag(data);
+      } catch (e: any) {
+        setDiag({ error: e.message });
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-slate-900">
+        <div className="w-full max-w-2xl bg-slate-800 p-8 rounded-[2.5rem] border border-slate-700 shadow-2xl space-y-6 overflow-hidden">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-black text-white flex items-center gap-2"><Settings size={24} className="text-blue-500"/> DB接続診断</h2>
+            <button onClick={() => setScreen('HOME')} className="text-slate-500 hover:text-white"><XCircle size={24}/></button>
+          </div>
+          
+          <div className="space-y-4">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input 
+                placeholder="診断用キー (未設定なら空でOK)" 
+                value={debugKey} 
+                onChange={e => setDebugKey(e.target.value)} 
+                className="flex-1 bg-slate-900 p-4 rounded-2xl text-white font-mono text-sm border border-slate-700 focus:border-blue-500 outline-none"
+              />
+              <button 
+                onClick={runDiag} 
+                disabled={loading}
+                className="bg-blue-600 px-8 py-4 rounded-2xl font-black text-white disabled:opacity-50 shadow-lg active:scale-95 transition-all"
+              >
+                {loading ? '診断中...' : '診断実行'}
+              </button>
+            </div>
+
+            {diag && (
+              <div className="bg-slate-950/50 p-6 rounded-3xl space-y-4 max-h-[50vh] overflow-y-auto border border-slate-700">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">診断結果</span>
+                  <button 
+                    onClick={() => {
+                      navigator.clipboard.writeText(JSON.stringify(diag, null, 2));
+                      alert('結果をコピーしました');
+                    }}
+                    className="text-[10px] bg-slate-800 px-3 py-1 rounded-full text-blue-400 font-bold flex items-center gap-1 hover:bg-slate-700 transition-colors"
+                  >
+                    <Copy size={12}/> コピー
+                  </button>
+                </div>
+                <pre className="text-[11px] font-mono text-green-400 whitespace-pre-wrap leading-relaxed">
+                  {JSON.stringify(diag, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
+          
+          <div className="p-4 bg-slate-900/50 rounded-2xl border border-slate-700/50">
+            <p className="text-[10px] text-slate-400 leading-relaxed font-bold">
+              ※本診断はデータベースの疎通、書き込み権限、環境変数の設定状況をテストします。
+              Vercel上で「ルームが見つからない」問題が発生する場合、Prisma接続とWriteTestが成功しているか確認してください。
+            </p>
           </div>
         </div>
       </div>
@@ -564,13 +766,12 @@ export default function App() {
     return false;
   });
 
-  const survivors = game.players.filter(p => p.isAlive);
-  const agreeCount = survivors.filter(p => p.skipAgreed).length;
-  const neededCount = Math.ceil(survivors.length / 2);
+  const survivorsList = game.players.filter(p => p.isAlive);
+  const agreeCount = survivorsList.filter(p => p.skipAgreed).length;
+  const neededCount = Math.ceil(survivorsList.length / 2);
 
   return (
     <div className="h-screen flex flex-col bg-slate-900 text-white overflow-hidden">
-      {/* 襲撃演出オーバーレイ */}
       {attackEffect && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black overflow-hidden pointer-events-auto">
           <style>{`
@@ -636,7 +837,13 @@ export default function App() {
               <div className="text-center text-[11px] font-black text-blue-400 uppercase tracking-widest bg-blue-500/10 py-2 rounded-xl border border-blue-500/20">
                 投票スキップ同意：{agreeCount} / {neededCount}
               </div>
-              <button onClick={() => setGame(prev => ({ ...prev, players: prev.players.map(p => p.id === currentUser.id ? { ...p, skipAgreed: !p.skipAgreed } : p) }))} className={`w-full py-4 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all ${me.skipAgreed ? 'bg-green-600 text-white shadow-lg shadow-green-500/20' : 'bg-slate-700 text-slate-300'}`}>{me.skipAgreed ? <CheckCircle2 size={16}/> : <XCircle size={16}/>} 投票をスキップ</button>
+              <button onClick={() => {
+                setGame(prev => {
+                  const next = { ...prev, players: prev.players.map(p => p.id === currentUser.id ? { ...p, skipAgreed: !p.skipAgreed } : p) };
+                  pushGameToServer(next);
+                  return next;
+                });
+              }} className={`w-full py-4 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all ${me.skipAgreed ? 'bg-green-600 text-white shadow-lg shadow-green-500/20' : 'bg-slate-700 text-slate-300'}`}>{me.skipAgreed ? <CheckCircle2 size={16}/> : <XCircle size={16}/>} 投票をスキップ</button>
             </div>
           )}
           {((game.phase === 'NIGHT' && !me.hasActed && ['wolf', 'seer', 'knight'].includes(me.roleId) && !(game.day === 1 && me.roleId === 'seer')) || ((game.phase === 'VOTE' || game.phase === 'REVOTE') && !me.hasActed)) && (
