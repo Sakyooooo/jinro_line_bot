@@ -1,4 +1,3 @@
-
 {
   "name": "werewolf-gm-bot-ultra",
   "version": "1.0.0",
@@ -13,8 +12,9 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "prisma": "^5.22.0",
     "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0"
+    "@types/react-dom": "^19.0.0",
+    "prisma": "^5.22.0",
+    "vite": "^7.3.1"
   }
 }
