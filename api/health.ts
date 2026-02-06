@@ -1,4 +1,6 @@
-import { PrismaClient } from '@prisma/client';
+import prismaPkg from "@prisma/client";
+const { PrismaClient } = prismaPkg as any;
+
 
 // 環境変数の補完
 if (!process.env.DATABASE_URL) {

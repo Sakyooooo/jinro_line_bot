@@ -1,4 +1,6 @@
-import { PrismaClient } from '@prisma/client';
+import prismaPkg from "@prisma/client";
+const { PrismaClient } = prismaPkg as any;
+
 
 // Vercel Postgres/Neon の環境変数名が異なる場合に対応
 if (!process.env.DATABASE_URL) {
