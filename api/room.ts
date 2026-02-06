@@ -1,5 +1,19 @@
-import prismaPkg from "@prisma/client";
-const { PrismaClient } = prismaPkg as any;
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const { PrismaClient } = require("@prisma/client");
+
+// PrismaClient は使い回し（Vercelで多重接続を防ぐ）
+const globalForPrisma = globalThis as unknown as { prisma?: any };
+
+export const prisma =
+  globalForPrisma.prisma ?? new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
+
 
 
 // Vercel Postgres/Neon の環境変数名が異なる場合に対応
@@ -11,7 +25,7 @@ if (!process.env.DATABASE_URL) {
   }
 }
 
-const prisma = new PrismaClient();
+
 
 // Node.js ランタイムを明示的に指定（Edge Runtime での Prisma 不具合回避）
 export const runtime = 'nodejs';

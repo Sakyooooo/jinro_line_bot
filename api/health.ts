@@ -1,5 +1,18 @@
-import prismaPkg from "@prisma/client";
-const { PrismaClient } = prismaPkg as any;
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const { PrismaClient } = require("@prisma/client");
+
+// PrismaClient は使い回し（Vercelで多重接続を防ぐ）
+const globalForPrisma = globalThis as unknown as { prisma?: any };
+
+export const prisma =
+  globalForPrisma.prisma ?? new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
 
 
 // 環境変数の補完
@@ -11,7 +24,7 @@ if (!process.env.DATABASE_URL) {
   }
 }
 
-const prisma = new PrismaClient();
+
 export const runtime = 'nodejs';
 
 export default async function handler(req: any, res: any) {
